@@ -16,7 +16,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 file(GLOB project_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
-file(GLOB project_HEADERS CONFIGURE_DEPENDS "src/*.h")
+file(GLOB project_HEADERS CONFIGURE_DEPENDS "src/*.h" "src/*.hpp")
 
 add_executable(sparse_states ${project_SOURCES} ${project_HEADERS})
 

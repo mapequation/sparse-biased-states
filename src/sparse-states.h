@@ -20,48 +20,11 @@ inline auto bias(const Node &prev, const Node &target, double p_inv, double q_in
     return 1.0;
 }
 
-
-inline auto bias(const Node &prev, const Node &target, double p_inv, double q_inv, double strength) {
-    // strength between 0 and 1
-    strength = std::clamp(strength, 0.0, 1.0);
-    // strength = 1 -- bias = p or q
-    // strength = 0 -- bias = 1
-    return bias(prev, target, p_inv, q_inv) * strength + (1 - strength);
-}
-
 constexpr StateId create_state_id(NodeId prev_id, NodeId current_id) {
     return prev_id << 16 | current_id;
 }
 
-enum class Divergence {
-    Unweighted,
-    Weighted,
-};
-
-auto div_to_string(Divergence d) {
-    switch (d) {
-        case Divergence::Unweighted:
-            return "unweighted";
-        case Divergence::Weighted:
-            return "weighted";
-    }
-}
-
-enum class Model {
-    Unweighted,
-    Weighted,
-};
-
-auto model_to_string(Model m) {
-    switch (m) {
-        case Model::Unweighted:
-            return "unweighted";
-        case Model::Weighted:
-            return "weighted";
-    }
-}
-
-inline auto create_states(Node &node, const auto &nodes, double p_inv, double q_inv, double thresh, Model model, Divergence div) noexcept {
+inline auto create_states(Node &node, const auto &nodes, double p_inv, double q_inv, double thresh, bool weighted) noexcept {
     // if only one in-link, the JSD is 0
     if (node.in_degree() <= 1) {
         node.expanded = false;
@@ -87,7 +50,7 @@ inline auto create_states(Node &node, const auto &nodes, double p_inv, double q_
         i++;
     }
 
-    if (model == Model::Weighted) {
+    if (weighted) {
         auto &in_links = node.in_links;
         std::transform(in_links.cbegin(), in_links.cend(), weights.begin(),
                        [sum_in_weight](auto &link) { return link.weight / sum_in_weight; });
@@ -96,11 +59,8 @@ inline auto create_states(Node &node, const auto &nodes, double p_inv, double q_
     DivisiveClustering clustering{X, weights};
     auto jsd = clustering.get_jsd();
 
-    auto in_degree = node.in_degree();
-    auto thresh_norm = div == Divergence::Unweighted ? 1.0 : sum_in_weight / in_degree;
-
     node.jsd_initial = jsd;
-    node.expanded = jsd > (thresh / thresh_norm);
+    node.expanded = jsd > thresh;
 
     if (!node.expanded) {
         node.states = {{node.node_id, node.node_id}};
@@ -135,20 +95,20 @@ inline auto create_states(Node &node, const auto &nodes, double p_inv, double q_
 }
 
 std::tuple<unsigned int, unsigned int>
-expand_nodes(auto &nodes, double p, double q, double thresh, Model model, Divergence div) {
+expand_nodes(auto &nodes, double p, double q, double thresh, bool weighted) {
     auto num_expanded = 0;
     auto num_states = 0;
     const auto p_inv = 1.0 / p;
     const auto q_inv = 1.0 / q;
 
-#pragma omp parallel for reduction(+:num_expanded, num_states) default(none) shared(nodes, p_inv, q_inv, thresh, model, div) schedule(dynamic)
+#pragma omp parallel for reduction(+:num_expanded, num_states) default(none) shared(nodes, p_inv, q_inv, thresh, weighted) schedule(dynamic)
     //for (auto &[node_id, node]: nodes) {
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         auto it = nodes.begin();
         std::advance(it, i);
         auto &[node_id, node] = *it;
 
-        create_states(node, nodes, p_inv, q_inv, thresh, model, div);
+        create_states(node, nodes, p_inv, q_inv, thresh, weighted);
 
         if (node.expanded) {
 #pragma omp critical
@@ -163,36 +123,8 @@ expand_nodes(auto &nodes, double p, double q, double thresh, Model model, Diverg
     return {num_expanded, num_states};
 }
 
-enum class Bias {
-    Unbiased,
-    Biased,
-    Weighted,
-};
-
-auto bias_to_string(Bias method) {
-    switch (method) {
-        case Bias::Biased:
-            return "biased";
-        case Bias::Unbiased:
-            return "unbiased";
-        case Bias::Weighted:
-            return "weighted biased";
-    }
-}
-
-auto bias_to_strength(Bias b, double strength) {
-    switch (b) {
-        case Bias::Biased:
-            return 1.0;
-        case Bias::Unbiased:
-            return 0.0;
-        case Bias::Weighted:
-            return strength;
-    }
-}
-
 std::tuple<std::vector<Link>, double>
-create_links_for_node(const auto &node, const auto &nodes, double p_inv, double q_inv, Bias method, bool self_links) noexcept {
+create_links_for_node(const auto &node, const auto &nodes, double p_inv, double q_inv, bool self_links) noexcept {
     std::vector<Link> links;
     std::unordered_map<NodeId, std::unordered_map<NodeId, double>> aggregated_links;
 
@@ -244,9 +176,9 @@ create_links_for_node(const auto &node, const auto &nodes, double p_inv, double 
     auto sum_weight = 0.0;
     auto sum_biased_weight = 0.0;
 
-    auto in_degree = node.in_degree();
-    auto log_norm = std::log2(in_degree > 1 ? in_degree : 2);
-    auto strength = bias_to_strength(method, node.jsd_initial / log_norm);
+    //auto in_degree = node.in_degree();
+    //auto log_norm = std::log2(in_degree > 1 ? in_degree : 2);
+    //auto strength = bias_to_strength(method, node.jsd_initial / log_norm);
 
     for (const auto &in_link: node.in_links) {
         const auto &prev = nodes.at(in_link.source);
@@ -258,7 +190,7 @@ create_links_for_node(const auto &node, const auto &nodes, double p_inv, double 
             }
 
             const auto &target = nodes.at(out_link.target);
-            auto weight = out_link.weight * bias(prev, target, p_inv, q_inv, strength);
+            auto weight = out_link.weight * bias(prev, target, p_inv, q_inv);
 
             sum_weight += out_link.weight;
             sum_biased_weight += weight;
@@ -282,20 +214,20 @@ create_links_for_node(const auto &node, const auto &nodes, double p_inv, double 
 }
 
 std::tuple<std::vector<Link>, double>
-create_links(const auto &nodes, double p, double q, Bias method, bool self_links = false) {
+create_links(const auto &nodes, double p, double q, bool self_links = false) {
     std::vector<Link> links;
     const auto p_inv = 1.0 / p;
     const auto q_inv = 1.0 / q;
     auto tot_weight = 0.0;
 
-#pragma omp parallel for reduction(+:tot_weight) default(none) shared(nodes, links, p_inv, q_inv, method, self_links) schedule(dynamic)
+#pragma omp parallel for reduction(+:tot_weight) default(none) shared(nodes, links, p_inv, q_inv, self_links) schedule(dynamic)
     //for (const auto &[node_id, node] : nodes) {
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         auto it = nodes.begin();
         std::advance(it, i);
         auto &[_, node] = *it;
 
-        auto [private_links, private_weight] = create_links_for_node(node, nodes, p_inv, q_inv, method, self_links);
+        auto [private_links, private_weight] = create_links_for_node(node, nodes, p_inv, q_inv, self_links);
         tot_weight += private_weight;
 
 #pragma omp critical

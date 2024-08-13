@@ -1,4 +1,3 @@
-#include <string_view>
 #include <vector>
 #include <iostream>
 #include <fstream>
@@ -10,6 +9,7 @@
 #include <omp.h>
 #endif
 
+#include "cxxopts.hpp"
 #include "network.h"
 #include "sparse-states.h"
 
@@ -31,14 +31,14 @@ struct Timer {
     time_point start;
 };
 
-auto run(std::ifstream &in, std::ofstream &out, double p, double q, double thresh, Model model, bool directed, Bias method, Divergence div) {
+auto run(std::ifstream &in, std::ofstream &out, double p, double q, double thresh, bool weighted, bool directed) {
     Timer total;
     Timer timer;
 
     // 0. Read links
     fmt::print(stdout, "Reading links... ");
     std::cout << std::flush;
-    auto [nodes, tot_weight] = read_links(in, model == Model::Weighted, directed);
+    auto [nodes, tot_weight] = read_links(in, weighted, directed);
     fmt::print("{} nodes, total link weight: {} ({} s)\n", nodes.size(), tot_weight, timer.elapsed().count());
 
     in.close();
@@ -47,7 +47,7 @@ auto run(std::ifstream &in, std::ofstream &out, double p, double q, double thres
     // 1. Expand nodes
     fmt::print(stdout,"Expanding nodes... ");
     std::cout << std::flush;
-    auto [num_expanded, num_states] = expand_nodes(nodes, p, q, thresh, model, div);
+    auto [num_expanded, num_states] = expand_nodes(nodes, p, q, thresh, weighted);
 
     auto tot_jsd = std::transform_reduce(nodes.cbegin(), nodes.cend(), 0.0, std::plus{},
                                          [](auto &it) { return it.second.jsd_initial; });
@@ -59,7 +59,7 @@ auto run(std::ifstream &in, std::ofstream &out, double p, double q, double thres
     // 2. Create links
     fmt::print(stdout, "Creating links... ");
     std::cout << std::flush;
-    auto [links, tot_created_weight] = create_links(nodes, p, q, method);
+    auto [links, tot_created_weight] = create_links(nodes, p, q);
     fmt::print("{} weighted, directed links, total weight: {} ({} s)\n", links.size(), tot_created_weight, timer.elapsed().count());
 
     timer.reset();
@@ -87,38 +87,51 @@ auto run(std::ifstream &in, std::ofstream &out, double p, double q, double thres
     }
 
     stats_out
-            << "p,q,t,weighted,directed,bias_method,divergence,num_expanded,num_states,num_links,elapsed\n"
-            << fmt::format("{},{},{},{},{},{},{},{},{},{},{}\n",
-                           p, q, thresh, model_to_string(model), directed, bias_to_string(method), div_to_string(div),
+            << "p,q,t,weighted,directed,num_expanded,num_states,num_links,elapsed\n"
+            << fmt::format("{},{},{},{},{},{},{},{},{}\n",
+                           p, q, thresh, weighted, directed,
                            num_expanded, num_states, links.size(), total.elapsed().count());
 
     stats_out.close();
 }
 
-auto usage(std::string_view program_name) {
-    std::cout
-            << "Usage:\n"
-            << program_name << " infile outfile [-p N] [-q N] [-t N] [-d] [--directed] [-w] [--weighted]\n";
-}
-
-auto fail(std::string_view message, std::string_view program_name) {
-    std::cerr << message;
-    usage(program_name);
-    return 1;
-}
-
 int main(int argc, const char **argv) {
-    std::vector<std::string_view> args(
-            argv, std::next(argv, static_cast<std::ptrdiff_t>(argc))
-    );
+    auto program_name = "sparse_states";
+    auto help_string = "";
 
-    if (args.size() < 3) {
-        usage(args[0]);
+    cxxopts::Options options(program_name, help_string);
+
+    options.add_options()
+            ("infile", "Input file", cxxopts::value<std::string>())
+            ("outfile", "Output file", cxxopts::value<std::string>())
+            ("p", "Return parameter", cxxopts::value<double>()->default_value("1.0"))
+            ("q", "In-out parameter", cxxopts::value<double>()->default_value("1.0"))
+            ("t", "Threshold", cxxopts::value<double>()->default_value("0.5"))
+            ("d,directed", "Directed network", cxxopts::value<bool>()->default_value("false"))
+            ("w,weighted", "Weighted network", cxxopts::value<bool>()->default_value("false"))
+            ("h,help", "Print help");
+
+    options.parse_positional({"infile", "outfile"});
+
+    auto result = options.parse(argc, argv);
+
+    if (result.count("help")) {
+        std::cout << options.help() << '\n';
+        return 0;
+    }
+
+    if (argc < 3) {
+        std::cout << options.help() << '\n';
         return 1;
     }
 
-    auto &infile = args[1];
-    auto &outfile = args[2];
+    if (result.count("infile") == 0 || result.count("outfile") == 0) {
+        std::cerr << "Missing infile or outfile\n";
+        return 1;
+    }
+
+    auto infile = result["infile"].as<std::string>();
+    auto outfile = result["outfile"].as<std::string>();
 
     std::ifstream in(infile);
     if (!in.is_open()) {
@@ -132,57 +145,33 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
-    double p = 1.0;
-    double q = 1.0;
-    double thresh = 0.5;
-    bool directed = false;
-    auto model = Model::Unweighted;
-    auto method = Bias::Biased;
-    auto div = Divergence::Unweighted;
-
-    for (std::size_t i = 0; const auto &arg: args) {
-        std::stringstream ss;
-        if (arg == "-w" || arg == "--weighted") {
-            model = Model::Weighted;
-        } else if (arg == "-d" || arg == "--directed") {
-            throw std::runtime_error("not implemented");
-            directed = true;
-        } else if (arg == "--unbiased") {
-            method = Bias::Unbiased;
-        } else if (arg == "--weighted-bias") {
-            method = Bias::Weighted;
-        } else if (arg == "--weighted-div") {
-            div = Divergence::Weighted;
-        } else if (arg == "-p" && args.size() != i + 1) {
-            ss << args[i + 1];
-            ss >> p;
-            if (ss.fail() || p <= 0.0) {
-                return fail("p must be positive!\n", args[0]);
-            }
-            ++i;
-            continue;
-        } else if (arg == "-q" && args.size() != i + 1) {
-            ss << args[i + 1];
-            ss >> q;
-            if (ss.fail() || q <= 0.0) {
-                return fail("q must be positive!\n", args[0]);
-            }
-            ++i;
-            continue;
-        } else if (arg == "-t" && args.size() != i + 1) {
-            ss << args[i + 1];
-            ss >> thresh;
-            if (ss.fail() || thresh <= 0.0) {
-                return fail("t must be positive!\n", args[0]);
-            }
-            ++i;
-            continue;
-        }
-        ++i;
-    }
+    auto p = result["p"].as<double>();
+    auto q = result["q"].as<double>();
 
     if (p == 1.0 && q == 1.0) {
-        return fail("Not both p and q can be equal to 1!\n", args[0]);
+        std::cerr << "At least one of p or q must not be equal to 1\n";
+        return 1;
+    }
+
+    if (p <= 0.0 || q <= 0.0) {
+        std::cerr << "p and q must be positive\n";
+        return 1;
+    }
+
+    auto thresh = result["t"].as<double>();
+
+    if (thresh <= 0.0) {
+        std::cerr << "Threshold must be positive\n";
+        return 1;
+    }
+
+    auto directed = result["d"].as<bool>();
+    auto weighted = result["w"].as<bool>();
+
+    // "weighted" is not implemented
+    if (weighted) {
+        std::cerr << "Weighted networks are not implemented\n";
+        return 1;
     }
 
 #ifdef _OPENMP
@@ -198,12 +187,10 @@ int main(int argc, const char **argv) {
             << "Output network: \"" << outfile << "\"\n\n"
             << "Using parameters:\n"
             << '\t' << (directed ? "directed" : "undirected") << '\n'
-            << '\t' << model_to_string(model) << "\n"
-            << '\t' << "write " << bias_to_string(method) << " links" << "\n"
-            << '\t' << "using " << div_to_string(div) << " divergence" << "\n"
+            << '\t' << (weighted ? "weighted" : "unweighted") << '\n'
             << "\tp = " << p << '\n'
             << "\tq = " << q << '\n'
             << "\tthreshold = " << thresh << " bits\n\n";
 
-    run(in, out, p, q, thresh, model, directed, method, div);
+    run(in, out, p, q, thresh, weighted, directed);
 }
